@@ -32,7 +32,8 @@ function getPageText() {
 }
 function countMatches(text, list) {
   let c = 0;
-  for (const w of list) if (text.toLowerCase().includes(w.toLowerCase())) c++;
+  const low = text.toLowerCase();
+  for (const w of list) if (low.includes(w.toLowerCase())) c++;
   return c;
 }
 function scoreForms() {
@@ -59,106 +60,290 @@ function computeRisk() {
   const formScore = scoreForms();
   let total = urlScore + textScore + formScore;
   if (total > 10) total = 10;
-  return { total, breakdown: { urlScore, textScore, formScore, amh, eng, brands }, sampleText: text.slice(0, 800) };
+
+  const level = total >= 7 ? "High" : total >= 4 ? "Medium" : total >= 2 ? "Guarded" : "Low";
+  return {
+    total,
+    level,
+    breakdown: { urlScore, textScore, formScore, amh, eng, brands },
+    sampleText: text.slice(0, 600)
+  };
 }
 
-// ======= Banner UI =======
-function ensureBanner() {
-  const id = "phishshield-banner";
-  let bar = document.getElementById(id);
-  if (bar) return bar;
-
-  bar = document.createElement("div");
-  bar.id = id;
-  Object.assign(bar.style, {
-    position: "fixed", zIndex: 2147483647, left: 0, right: 0, top: 0,
-    padding: "10px 14px", fontFamily: "system-ui, Arial, sans-serif",
-    fontSize: "14px", color: "#0b0b0b", display: "flex", alignItems: "center",
-    gap: "10px", boxShadow: "0 2px 10px rgba(0,0,0,.15)", background: "#fffbe6"
-  });
-
-  const dot = document.createElement("span");
-  Object.assign(dot.style, { width: "10px", height: "10px", borderRadius: "50%", display: "inline-block" });
-
-  const text = document.createElement("span"); text.style.flex = "1";
-
-  const report = document.createElement("button");
-  report.textContent = "Report as phishing";
-  Object.assign(report.style, { border: "1px solid #ccc", background: "white", padding: "4px 8px", cursor: "pointer" });
-
-  const close = document.createElement("button");
-  close.textContent = "Dismiss";
-  Object.assign(close.style, { border: "1px solid #ccc", background: "white", padding: "4px 8px", cursor: "pointer" });
-  close.onclick = () => bar.remove();
-
-  bar.append(dot, text, report, close);
-  document.documentElement.appendChild(bar);
-
-  // attach click later after first scan so it captures risk snapshot
-  bar.__phish_report_btn = report;
-  bar.__phish_text_node = text;
-  bar.__phish_dot = dot;
-  return bar;
-}
-
-async function saveReport(payload) {
-  // Append to storage array "phish_reports"
+// ======= Storage helpers (reports + history) =======
+function saveReport(payload) {
   return new Promise((resolve) => {
     chrome.storage.local.get({ phish_reports: [] }, (data) => {
       const arr = Array.isArray(data.phish_reports) ? data.phish_reports : [];
       arr.unshift(payload);
-      // keep last 200
-      const trimmed = arr.slice(0, 200);
-      chrome.storage.local.set({ phish_reports: trimmed }, () => resolve(true));
+      chrome.storage.local.set({ phish_reports: arr.slice(0, 200) }, () => resolve(true));
     });
   });
 }
 
-function setBanner(risk) {
-  const bar = ensureBanner();
-  const dot = bar.__phish_dot;
-  const textNode = bar.__phish_text_node;
-  let level = "Low", bg = "#e8fff1", dotColor = "#2ecc71";
-  if (risk.total >= 3 && risk.total < 6) { level = "Medium"; bg = "#fffbe6"; dotColor = "#f1c40f"; }
-  else if (risk.total >= 6) { level = "High"; bg = "#ffecec"; dotColor = "#e74c3c"; }
-  bar.style.background = bg; dot.style.background = dotColor;
+function upsertScanHistory(entry) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get({ scan_history: [] }, (data) => {
+      let list = Array.isArray(data.scan_history) ? data.scan_history : [];
+      // upsert by hostname
+      const i = list.findIndex(x => x.hostname === entry.hostname);
+      if (i >= 0) list[i] = entry; else list.unshift(entry);
+      list = list.slice(0, 100);
+      chrome.storage.local.set({ scan_history: list }, () => resolve(list));
+    });
+  });
+}
+function getScanHistory() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get({ scan_history: [] }, (data) => resolve(Array.isArray(data.scan_history) ? data.scan_history : []));
+  });
+}
 
-  const { urlScore, textScore, formScore, amh, eng, brands } = risk.breakdown;
-  textNode.textContent = `PhishShield: Risk ${level} (${risk.total.toFixed(1)}/10) | URL:${urlScore.toFixed(1)} Text:${textScore.toFixed(1)} Forms:${formScore.toFixed(1)} | አማርኛ:${amh} EN:${eng} Brands:${brands}`;
+// ======= UI (Bottom-right pill + expandable panel) =======
+function ensureUI() {
+  const id = "ethioshield-pill";
+  let pill = document.getElementById(id);
+  if (pill) return pill;
 
-  // wire up report button (snapshot current page state)
-  if (!bar.__wired_report) {
-    bar.__wired_report = true;
-    bar.__phish_report_btn.onclick = async () => {
-      const payload = {
-        url: location.href,
-        hostname: location.hostname,
-        when: new Date().toISOString(),
-        risk: risk.total,
-        breakdown: risk.breakdown,
-        sampleText: risk.sampleText
-      };
-      await saveReport(payload);
-      bar.__phish_report_btn.textContent = "Reported ✓";
-      bar.__phish_report_btn.disabled = true;
-      setTimeout(() => {
-        bar.__phish_report_btn.textContent = "Report as phishing";
-        bar.__phish_report_btn.disabled = false;
-      }, 1500);
-    };
+  // Pill (minimal)
+  pill = document.createElement("div");
+  pill.id = id;
+  Object.assign(pill.style, {
+    position: "fixed",
+    right: "12px",
+    bottom: "12px",
+    zIndex: 2147483647,
+    fontFamily: "system-ui, Arial, sans-serif",
+    fontSize: "13px",
+    color: "#111",
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    background: "rgba(255,255,255,0.95)",
+    border: "1px solid rgba(0,0,0,0.1)",
+    borderRadius: "999px",
+    boxShadow: "0 6px 20px rgba(0,0,0,.15)",
+    padding: "6px 10px",
+    cursor: "pointer",
+    backdropFilter: "saturate(180%) blur(8px)",
+    userSelect: "none",
+    maxWidth: "70vw"
+  });
+
+  const dot = document.createElement("span");
+  Object.assign(dot.style, { width: "10px", height: "10px", borderRadius: "50%", display: "inline-block", flexShrink: "0" });
+
+  const label = document.createElement("span");
+  label.textContent = "Ethio Shield";
+  label.style.fontWeight = "600";
+
+  const chev = document.createElement("span");
+  chev.textContent = "▸";
+  chev.style.opacity = "0.7";
+
+  // Panel
+  const panel = document.createElement("div");
+  panel.id = "ethioshield-panel";
+  Object.assign(panel.style, {
+    position: "fixed",
+    right: "12px",
+    bottom: "56px",
+    zIndex: 2147483647,
+    width: "min(420px, 92vw)",
+    maxHeight: "65vh",
+    overflow: "auto",
+    background: "#ffffff",
+    border: "1px solid rgba(0,0,0,0.12)",
+    borderRadius: "14px",
+    boxShadow: "0 12px 28px rgba(0,0,0,.22)",
+    padding: "12px",
+    display: "none"
+  });
+
+  // Top badge (big risk + icon)
+  const badge = document.createElement("div");
+  Object.assign(badge.style, {
+    display: "flex", alignItems: "center", gap: "10px",
+    padding: "12px", borderRadius: "12px", marginBottom: "10px",
+    fontWeight: "700", fontSize: "16px"
+  });
+  const icon = document.createElement("span"); // 👍 ⚠️ ❗
+  icon.style.fontSize = "18px";
+  const badgeText = document.createElement("span");
+
+  // Dropdown (sites scanned)
+  const row = document.createElement("div");
+  Object.assign(row.style, { display: "flex", gap: "8px", alignItems: "center", marginBottom: "8px" });
+
+  const select = document.createElement("select");
+  Object.assign(select.style, { flex: "1", padding: "6px", borderRadius: "8px", border: "1px solid #ddd", background: "#fff" });
+  const viewBtn = document.createElement("button");
+  viewBtn.textContent = "View";
+  Object.assign(viewBtn.style, { padding: "6px 10px", border: "1px solid #ccc", background: "#fff", borderRadius: "8px", cursor: "pointer" });
+
+  // Details area (collapsed info – not overwhelming)
+  const detailsBox = document.createElement("div");
+  Object.assign(detailsBox.style, {
+    padding: "10px",
+    borderRadius: "10px",
+    background: "#fafafa",
+    border: "1px solid #eee",
+    fontSize: "12px",
+    lineHeight: "1.4",
+    color: "#333",
+    display: "none", // hidden until "View" is clicked
+    whiteSpace: "pre-wrap"
+  });
+
+  // Action row
+  const actions = document.createElement("div");
+  Object.assign(actions.style, { display: "flex", gap: "8px", marginTop: "10px" });
+
+  const reportBtn = document.createElement("button");
+  reportBtn.textContent = "Report page";
+  Object.assign(reportBtn.style, { padding: "6px 10px", border: "1px solid #ccc", background: "#fff", borderRadius: "8px", cursor: "pointer" });
+
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "Dismiss";
+  Object.assign(closeBtn.style, { padding: "6px 10px", border: "1px solid #ccc", background: "#fff", borderRadius: "8px", cursor: "pointer" });
+
+  row.append(select, viewBtn);
+  actions.append(reportBtn, closeBtn);
+  panel.append(badge, row, detailsBox, actions);
+
+  pill.append(dot, label, chev);
+  document.documentElement.appendChild(pill);
+  document.documentElement.appendChild(panel);
+
+  // Behavior
+  let open = false;
+  pill.addEventListener("click", async () => {
+    open = !open;
+    panel.style.display = open ? "block" : "none";
+    chev.textContent = open ? "▾" : "▸";
+    if (open) populateDropdown(select); // refresh history when opened
+  });
+  closeBtn.addEventListener("click", () => {
+    panel.style.display = "none";
+    open = false;
+    chev.textContent = "▸";
+  });
+
+  // Keep references
+  pill.__dot = dot;
+  pill.__panel = panel;
+  pill.__badge = badge;
+  pill.__badgeText = badgeText;
+  pill.__badgeIcon = icon;
+  pill.__select = select;
+  pill.__viewBtn = viewBtn;
+  pill.__details = detailsBox;
+  pill.__reportBtn = reportBtn;
+
+  // Insert badge children
+  badge.append(icon, badgeText);
+
+  // View button behavior
+  viewBtn.addEventListener("click", async () => {
+    const val = select.value;
+    if (!val) return;
+    const list = await getScanHistory();
+    const item = list.find(x => x.hostname === val);
+    if (!item) return;
+    detailsBox.style.display = "block";
+    const b = item.breakdown || {};
+    detailsBox.textContent =
+`Host: ${item.hostname}
+Last URL: ${item.url}
+Risk: ${item.level} (${item.total?.toFixed ? item.total.toFixed(1) : item.total}/10)
+URL Score: ${b.urlScore?.toFixed ? b.urlScore.toFixed(1) : b.urlScore} | Text: ${b.textScore?.toFixed ? b.textScore.toFixed(1) : b.textScore} | Forms: ${b.formScore?.toFixed ? b.formScore.toFixed(1) : b.formScore}
+Amharic: ${b.amh} | English: ${b.eng} | Brands: ${b.brands}`;
+  });
+
+  // Report current page
+  reportBtn.addEventListener("click", async () => {
+    const risk = computeRisk();
+    await saveReport({
+      url: location.href,
+      hostname: location.hostname,
+      when: new Date().toISOString(),
+      risk: risk.total,
+      level: risk.level,
+      breakdown: risk.breakdown,
+      sampleText: risk.sampleText
+    });
+    reportBtn.textContent = "Reported ✓";
+    reportBtn.disabled = true;
+    setTimeout(() => { reportBtn.textContent = "Report page"; reportBtn.disabled = false; }, 1500);
+  });
+
+  return pill;
+}
+
+async function populateDropdown(select) {
+  const list = await getScanHistory();
+  select.innerHTML = "";
+  if (!list.length) {
+    const opt = document.createElement("option");
+    opt.value = ""; opt.textContent = "No sites scanned yet";
+    select.appendChild(opt);
+    return;
   }
+  for (const item of list) {
+    const opt = document.createElement("option");
+    opt.value = item.hostname;
+    opt.textContent = `${item.hostname} — ${item.level}`;
+    select.appendChild(opt);
+  }
+}
+
+// Color systems for badge & dot
+function colorsFor(level) {
+  switch (level) {
+    case "Low":     return { bg: "#e8fff1", text: "#0b5137", dot: "#2ecc71", icon: "👍" };
+    case "Guarded": return { bg: "#eef7ff", text: "#0b3d91", dot: "#3fa7ff", icon: "🛡️" };
+    case "Medium":  return { bg: "#fffbe6", text: "#7c5a00", dot: "#f1c40f", icon: "⚠️" };
+    case "High":    return { bg: "#ffecec", text: "#7c1616", dot: "#e74c3c", icon: "❗" };
+    default:        return { bg: "#eef7ff", text: "#0b3d91", dot: "#3fa7ff", icon: "🛡️" };
+  }
+}
+
+function applyRiskUI(risk) {
+  const pill = ensureUI();
+  const { __dot: dot, __panel: panel, __badge: badge, __badgeText: badgeText, __badgeIcon: icon } = pill;
+
+  // Minimal view: color dot only
+  const c = colorsFor(risk.level);
+  dot.style.background = c.dot;
+
+  // Expanded: big badge with color + icon + simple label only
+  badge.style.background = c.bg;
+  badge.style.color = c.text;
+  icon.textContent = c.icon;
+  badgeText.textContent = `${risk.level} risk on this page`;
+
+  // Save to history (hostname-level)
+  upsertScanHistory({
+    hostname: location.hostname,
+    url: location.href,
+    total: risk.total,
+    level: risk.level,
+    breakdown: risk.breakdown,
+    when: Date.now()
+  });
 }
 
 // ======= Run & observe =======
 function scanAndRender() {
   try {
     const risk = computeRisk();
-    setBanner(risk);
+    applyRiskUI(risk);
   } catch {}
 }
 scanAndRender();
+
 const obs = new MutationObserver(() => {
-  clearTimeout(window.__phishshield_t);
-  window.__phishshield_t = setTimeout(scanAndRender, 400);
+  clearTimeout(window.__ethioshield_t);
+  window.__ethioshield_t = setTimeout(scanAndRender, 400);
 });
 obs.observe(document.documentElement, { childList: true, subtree: true });
