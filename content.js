@@ -1,4 +1,8 @@
-// ======= Config: keywords & weights =======
+/* =========================
+   Ethio Shield (compiled)
+   ========================= */
+
+// ---------- Config: keywords ----------
 const AMHARIC_KEYWORDS = [
   "ነፃ","በነፃ","ማግኘት","እንዲያገኙ","ይግቡ","መግባት","ይመዝገቡ","ይንቁ",
   "የሚጠፋ","አሁን","አስቸኳይ","የመለያ ማረጋገጫ","መክፈያ","የባንክ መለያ",
@@ -14,18 +18,23 @@ const BRAND_CUES = [
   "dashen bank","bank of abyssinia","awash bank"
 ];
 
-// ======= URL heuristics =======
+// ---------- Default allowlist (plus user-added) ----------
+const DEFAULT_ALLOWLIST = new Set([
+  "chat.openai.com","openai.com","www.google.com","accounts.google.com",
+  "github.com","www.youtube.com","youtube.com","docs.google.com"
+]);
+
+// ---------- Heuristics ----------
 function scoreUrl(hostname) {
   let s = 0;
   if ((hostname.match(/-/g) || []).length >= 2) s += 1.5;
   if (/[0-9]/.test(hostname)) s += 0.5;
-  if (/[^\x00-\x7F]/.test(hostname)) s += 1.5;
+  if (/[^\x00-\x7F]/.test(hostname)) s += 1.5;            // unicode/puny-looking
   if (hostname.split(".").slice(-2)[0].length <= 3) s += 0.5;
   if (/\b(login|secure|verify|update)\b/i.test(hostname)) s += 1;
   return s;
 }
 
-// ======= Text & forms =======
 function getPageText() {
   const t = document.body ? (document.body.innerText || "") : "";
   return t.slice(0, 50000);
@@ -36,41 +45,100 @@ function countMatches(text, list) {
   for (const w of list) if (low.includes(w.toLowerCase())) c++;
   return c;
 }
+
+// Safer form scoring: only likely credential forms; cross-origin posts weigh more
 function scoreForms() {
   let s = 0;
-  const forms = Array.from(document.querySelectorAll("form"));
+  const forms = document.querySelectorAll("form");
   for (const f of forms) {
-    const inputs = Array.from(f.querySelectorAll("input[type='password'], input[type='email'], input[type='text']"));
-    if (inputs.length >= 2) s += 0.5;
+    const pw = f.querySelector("input[type='password']");
+    const userLike = f.querySelector("input[type='email'], input[name*='user'], input[name*='login']");
+    if (!(pw || userLike)) continue; // ignore non-auth forms
+
     const action = (f.getAttribute("action") || "").trim();
-    if (action && !action.startsWith("/") && !action.includes(location.hostname)) s += 1.0;
+    const isSameOrigin = !action || action.startsWith("/") || action.includes(location.hostname);
+    if (!isSameOrigin) s += 1.0;   // possible credential exfil
+    else s += 0.2;                 // tiny bump for auth-looking forms
   }
   return s;
 }
 
-// ======= Risk =======
-function computeRisk() {
+// Safer text scoring: require multiple cues; cap brand weight on non-financial
+const TEXT_BASE = 0.4;
+const AMH_WEIGHT = 1.0;
+const ENG_WEIGHT = 0.6;
+const BRAND_WEIGHT = 0.8;
+const FIN_HOST_HINT = /(bank|payment|pay|card|wallet|telebirr|finance|billing)/i;
+
+function textScoreFromCounts(amh, eng, brands, hostname) {
+  let brandsCapped = brands;
+  const hostLooksFinancial = FIN_HOST_HINT.test(hostname);
+  if (!hostLooksFinancial) brandsCapped = Math.min(brands, 1); // cap on non-financial hosts
+
+  let score = 0;
+  const signals = (amh > 0) + (eng > 0) + (brandsCapped > 0);
+  if (signals >= 1) score += TEXT_BASE;
+  if (amh >= 2) score += AMH_WEIGHT * Math.min(amh, 6) / 2;
+  if (eng >= 2) score += ENG_WEIGHT * Math.min(eng, 6) / 2;
+  if (brandsCapped >= 1) score += BRAND_WEIGHT * Math.min(brandsCapped, 4) / 2;
+  return score;
+}
+
+async function getUserAllowlist() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get({ ethio_allow: [] }, (d) => resolve(new Set(d.ethio_allow || [])));
+  });
+}
+async function addToUserAllowlist(hostname) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get({ ethio_allow: [] }, (d) => {
+      const set = new Set(d.ethio_allow || []);
+      set.add(hostname);
+      chrome.storage.local.set({ ethio_allow: [...set] }, () => resolve(true));
+    });
+  });
+}
+
+// ---------- Risk ----------
+function computeRiskRaw() {
   const hostname = location.hostname;
   const urlScore = scoreUrl(hostname);
   const text = getPageText();
   const amh = countMatches(text, AMHARIC_KEYWORDS);
   const eng = countMatches(text, EN_KEYWORDS);
   const brands = countMatches(text, BRAND_CUES);
-  const textScore = amh * 1.2 + eng * 0.8 + brands * 1.0;
+  const textScore = textScoreFromCounts(amh, eng, brands, hostname);
   const formScore = scoreForms();
   let total = urlScore + textScore + formScore;
   if (total > 10) total = 10;
 
   const level = total >= 7 ? "High" : total >= 4 ? "Medium" : total >= 2 ? "Guarded" : "Low";
   return {
-    total,
-    level,
+    total, level,
     breakdown: { urlScore, textScore, formScore, amh, eng, brands },
     sampleText: text.slice(0, 600)
   };
 }
 
-// ======= Storage (reports + history + theme) =======
+async function applyAllowlistAdjustments(risk) {
+  const hostname = location.hostname;
+  const userAllow = await getUserAllowlist();
+  const trusted = userAllow.has(hostname) || DEFAULT_ALLOWLIST.has(hostname);
+  if (trusted) {
+    // So trusted sites don't look scary. Cap to Guarded max.
+    risk.total = Math.min(risk.total, 3.5);
+    risk.level = risk.total >= 2 ? (risk.total >= 3.5 ? "Guarded" : "Guarded") : "Low";
+    risk.trusted = true;
+  }
+  return risk;
+}
+
+async function computeRisk() {
+  const base = computeRiskRaw();
+  return await applyAllowlistAdjustments(base);
+}
+
+// ---------- Storage (reports + history + theme) ----------
 function saveReport(payload) {
   return new Promise((resolve) => {
     chrome.storage.local.get({ phish_reports: [] }, (data) => {
@@ -111,7 +179,7 @@ function setTheme(mode) {
   });
 }
 
-// ======= Colors (eye-friendly) =======
+// ---------- Colors (calm palette) ----------
 function colorsFor(level) {
   switch (level) {
     case "Low":     return { bg: "#e8fff1", text: "#0b5137", dot: "#2ecc71", icon: "👍" };
@@ -122,26 +190,14 @@ function colorsFor(level) {
   }
 }
 const palette = {
-  light: {
-    surface: "rgba(255,255,255,0.95)",
-    border: "rgba(0,0,0,0.18)",
-    text: "#111",
-    controlBg: "#ffffff",
-    controlText: "#111",
-    subtle: "#f6f6f6"
-  },
-  dark: {
-    surface: "rgba(22,22,22,0.92)",
-    border: "rgba(255,255,255,0.22)",
-    text: "#f2f2f2",
-    controlBg: "#2a2a2a",
-    controlText: "#f2f2f2",
-    subtle: "#1f1f1f"
-  }
+  light: { surface: "rgba(255,255,255,0.95)", border: "rgba(0,0,0,0.18)", text: "#111",
+           controlBg: "#ffffff", controlText: "#111", subtle: "#f6f6f6" },
+  dark:  { surface: "rgba(22,22,22,0.92)", border: "rgba(255,255,255,0.22)", text: "#f2f2f2",
+           controlBg: "#2a2a2a", controlText: "#f2f2f2", subtle: "#1f1f1f" }
 };
 
-// ======= UI (Pill unchanged; Panel improved) =======
-function ensurePill() {
+// ---------- UI: pill (minimal) ----------
+function ensurePill(logoUrl) {
   const id = "ethioshield-pill";
   let pill = document.getElementById(id);
   if (pill) return pill;
@@ -170,6 +226,15 @@ function ensurePill() {
     maxWidth: "70vw"
   });
 
+  // Optional logo in pill
+  if (logoUrl) {
+    const logo = document.createElement("img");
+    logo.src = logoUrl;
+    logo.alt = "Ethio Shield";
+    Object.assign(logo.style, { width: "16px", height: "16px", borderRadius: "4px", flexShrink: "0" });
+    pill.appendChild(logo);
+  }
+
   const dot = document.createElement("span");
   Object.assign(dot.style, { width: "10px", height: "10px", borderRadius: "50%", display: "inline-block", flexShrink: "0" });
 
@@ -183,12 +248,12 @@ function ensurePill() {
 
   pill.append(dot, label, chev);
   document.documentElement.appendChild(pill);
-
   pill.__dot = dot;
   pill.__chev = chev;
   return pill;
 }
 
+// ---------- UI: panel (expanded) ----------
 function ensurePanel() {
   const id = "ethioshield-panel";
   let panel = document.getElementById(id);
@@ -204,7 +269,7 @@ function ensurePanel() {
     width: "min(420px, 92vw)",
     maxHeight: "65vh",
     overflow: "auto",
-    background: palette.light.surface, // will theme on open
+    background: palette.light.surface,
     border: `1px solid ${palette.light.border}`,
     borderRadius: "14px",
     boxShadow: "0 12px 28px rgba(0,0,0,.22)",
@@ -220,36 +285,32 @@ function ensurePanel() {
     padding: "12px", borderRadius: "12px", marginBottom: "8px",
     fontWeight: "700", fontSize: "16px"
   });
-  const icon = document.createElement("span");
-  icon.style.fontSize = "18px";
+  const icon = document.createElement("span"); icon.style.fontSize = "18px";
   const badgeText = document.createElement("span");
 
   // Subline
   const sub = document.createElement("div");
   Object.assign(sub.style, { marginTop: "6px", fontSize: "12px", opacity: "0.9" });
 
-  // Row: dropdown
+  // Dropdown row
   const row = document.createElement("div");
   Object.assign(row.style, { display: "flex", gap: "8px", alignItems: "center", margin: "10px 0" });
 
   const select = document.createElement("select");
   Object.assign(select.style, {
-    flex: "1", padding: "8px", borderRadius: "10px", border: `1px solid ${palette.light.border}`, outline: "none",
+    flex: "1", padding: "8px", borderRadius: "10px",
+    border: `1px solid ${palette.light.border}`, outline: "none",
     background: palette.light.controlBg, color: palette.light.controlText
   });
 
   // Details box
   const detailsBox = document.createElement("div");
   Object.assign(detailsBox.style, {
-    padding: "10px",
-    borderRadius: "10px",
+    padding: "10px", borderRadius: "10px",
     border: `1px solid ${palette.light.border}`,
     background: palette.light.subtle,
-    fontSize: "12px",
-    lineHeight: "1.4",
-    display: "none",
-    whiteSpace: "pre-wrap",
-    color: palette.light.text
+    fontSize: "12px", lineHeight: "1.4",
+    display: "none", whiteSpace: "pre-wrap", color: palette.light.text
   });
 
   // Actions
@@ -270,29 +331,22 @@ function ensurePanel() {
     return b;
   }
 
-  const viewBtn = mkBtn("View");
+  const viewBtn   = mkBtn("View");
   const reportBtn = mkBtn("Report page");
-  const reportsBtn = mkBtn("View reports");
-  const themeBtn = mkBtn("Dark mode");
-  const closeBtn = mkBtn("Dismiss");
+  const reportsBtn= mkBtn("View reports");
+  const trustBtn  = mkBtn("Mark this site safe"); // NEW
+  const themeBtn  = mkBtn("Dark mode");
+  const closeBtn  = mkBtn("Dismiss");
 
-  // Report list
   const reportList = document.createElement("div");
   Object.assign(reportList.style, {
-    marginTop: "8px",
-    padding: "10px",
-    borderRadius: "10px",
-    border: `1px solid ${palette.light.border}`,
-    background: palette.light.subtle,
-    display: "none",
-    maxHeight: "220px",
-    overflow: "auto",
-    fontSize: "12px",
-    lineHeight: "1.4",
-    color: palette.light.text
+    marginTop: "8px", padding: "10px", borderRadius: "10px",
+    border: `1px solid ${palette.light.border}`, background: palette.light.subtle,
+    display: "none", maxHeight: "220px", overflow: "auto",
+    fontSize: "12px", lineHeight: "1.4", color: palette.light.text
   });
 
-  actions.append(viewBtn, reportBtn, reportsBtn, themeBtn, closeBtn);
+  actions.append(viewBtn, reportBtn, reportsBtn, trustBtn, themeBtn, closeBtn);
   const badgeWrap = document.createElement("div");
   badgeWrap.append(badge, sub);
   badge.append(icon, badgeText);
@@ -303,25 +357,22 @@ function ensurePanel() {
   // Theme handling
   function applyTheme(mode) {
     const p = palette[mode];
-    panel.style.background = p.surface;
-    panel.style.borderColor = p.border;
-    panel.style.color = p.text;
-    select.style.background = p.controlBg;  select.style.color = p.controlText; select.style.borderColor = p.border;
-    detailsBox.style.background = p.subtle; detailsBox.style.color = p.text; detailsBox.style.borderColor = p.border;
-    reportList.style.background = p.subtle; reportList.style.color = p.text; reportList.style.borderColor = p.border;
-    [viewBtn, reportBtn, reportsBtn, themeBtn, closeBtn].forEach(b => { b.style.background = p.controlBg; b.style.color = p.controlText; b.style.borderColor = p.border; });
+    panel.style.background = p.surface; panel.style.borderColor = p.border; panel.style.color = p.text;
+    select.style.background = p.controlBg; select.style.color = p.controlText; select.style.borderColor = p.border;
+    [detailsBox, reportList].forEach(el => { el.style.background = p.subtle; el.style.color = p.text; el.style.borderColor = p.border; });
+    [viewBtn, reportBtn, reportsBtn, trustBtn, themeBtn, closeBtn].forEach(b => {
+      b.style.background = p.controlBg; b.style.color = p.controlText; b.style.borderColor = p.border;
+    });
     themeBtn.textContent = mode === "light" ? "Dark mode" : "Light mode";
   }
-
-  // Wire behavior
   getTheme().then(applyTheme);
 
   panel.__applyTheme = applyTheme;
-  panel.__refs = { badge, icon, badgeText, sub, select, detailsBox, viewBtn, reportBtn, reportsBtn, themeBtn, closeBtn, reportList };
+  panel.__refs = { badge, icon, badgeText, sub, select, detailsBox, viewBtn, reportBtn, reportsBtn, trustBtn, themeBtn, closeBtn, reportList };
   return panel;
 }
 
-// Populate dropdown
+// ---------- Dropdown population ----------
 async function populateDropdown(select) {
   const list = await getScanHistory();
   select.innerHTML = "";
@@ -338,9 +389,10 @@ async function populateDropdown(select) {
   }
 }
 
-// ======= Apply risk to UI =======
-function applyRiskUI(risk) {
-  const pill = ensurePill();
+// ---------- Apply risk to UI ----------
+async function applyRiskUI(risk) {
+  const logoUrl = chrome.runtime.getURL("ui/logo.svg"); // or .png
+  const pill = ensurePill(logoUrl);
   const panel = ensurePanel();
   const { badge, icon, badgeText, sub } = panel.__refs;
 
@@ -348,11 +400,11 @@ function applyRiskUI(risk) {
   const c = colorsFor(risk.level);
   pill.__dot.style.background = c.dot;
 
-  // Badge (expanded)
+  // Badge
   badge.style.background = c.bg;
   badge.style.color = c.text;
   icon.textContent = c.icon;
-  badgeText.textContent = `${risk.level} risk on this page`;
+  badgeText.textContent = `${risk.level} risk on this page${risk.trusted ? " — Trusted site" : ""}`;
 
   // Dynamic subline
   const b = risk.breakdown;
@@ -379,7 +431,7 @@ function applyRiskUI(risk) {
     });
   }
 
-  const { select, detailsBox, viewBtn, reportBtn, reportsBtn, themeBtn, closeBtn, reportList } = panel.__refs;
+  const { select, detailsBox, viewBtn, reportBtn, reportsBtn, trustBtn, themeBtn, closeBtn, reportList } = panel.__refs;
 
   if (!panel.__actionsWired) {
     panel.__actionsWired = true;
@@ -401,7 +453,7 @@ Amharic: ${d.amh} • English: ${d.eng} • Brands: ${d.brands}`;
     });
 
     reportBtn.addEventListener("click", async () => {
-      const r = computeRisk();
+      const r = await computeRisk(); // include allowlist status in snapshot
       await saveReport({
         url: location.href,
         hostname: location.hostname,
@@ -409,7 +461,8 @@ Amharic: ${d.amh} • English: ${d.eng} • Brands: ${d.brands}`;
         risk: r.total,
         level: r.level,
         breakdown: r.breakdown,
-        sampleText: r.sampleText
+        sampleText: r.sampleText,
+        trusted: !!r.trusted
       });
       reportBtn.textContent = "Reported ✓";
       reportBtn.disabled = true;
@@ -424,17 +477,19 @@ Amharic: ${d.amh} • English: ${d.eng} • Brands: ${d.brands}`;
         if (!all.length) {
           reportList.textContent = "No reports yet.";
         } else {
-          const p = await getTheme().then(t => palette[t]);
+          const theme = await getTheme();
+          const border = theme === "light" ? palette.light.border : palette.dark.border;
           for (const r of all) {
             const row = document.createElement("div");
             row.style.padding = "6px 0";
-            row.style.borderBottom = `1px solid ${(await getTheme()) === "light" ? palette.light.border : palette.dark.border}`;
+            row.style.borderBottom = `1px solid ${border}`;
             const a = document.createElement("a");
             a.href = r.url; a.target = "_blank"; a.textContent = r.url;
-            a.style.color = p.controlText; a.style.textDecoration = "underline";
+            a.style.textDecoration = "underline";
+            a.style.color = "inherit";
             row.appendChild(a);
             const meta = document.createElement("div");
-            meta.textContent = `${new Date(r.when).toLocaleString()} — ${r.level} (${r.risk?.toFixed ? r.risk.toFixed(1) : r.risk}/10)`;
+            meta.textContent = `${new Date(r.when).toLocaleString()} — ${r.level} (${r.risk?.toFixed ? r.risk.toFixed(1) : r.risk}/10)${r.trusted ? " • Trusted" : ""}`;
             meta.style.opacity = "0.85"; meta.style.fontSize = "11.5px";
             row.appendChild(meta);
             reportList.appendChild(row);
@@ -443,6 +498,15 @@ Amharic: ${d.amh} • English: ${d.eng} • Brands: ${d.brands}`;
       } else {
         reportList.style.display = "none";
       }
+    });
+
+    trustBtn.addEventListener("click", async () => {
+      await addToUserAllowlist(location.hostname);
+      trustBtn.textContent = "Marked safe ✓";
+      trustBtn.disabled = true;
+      // Recompute to reflect new trust
+      const updated = await computeRisk();
+      await applyRiskUI(updated);
     });
 
     themeBtn.addEventListener("click", async () => {
@@ -459,12 +523,14 @@ Amharic: ${d.amh} • English: ${d.eng} • Brands: ${d.brands}`;
   }
 }
 
-// ======= Run & observe =======
-function scanAndRender() {
+// ---------- Run & observe ----------
+async function scanAndRender() {
   try {
-    const risk = computeRisk();
-    applyRiskUI(risk);
-  } catch {}
+    const risk = await computeRisk();
+    await applyRiskUI(risk);
+  } catch (e) {
+    // console.error("Ethio Shield error:", e);
+  }
 }
 scanAndRender();
 
@@ -473,3 +539,4 @@ const obs = new MutationObserver(() => {
   window.__ethioshield_t = setTimeout(scanAndRender, 400);
 });
 obs.observe(document.documentElement, { childList: true, subtree: true });
+  
