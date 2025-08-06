@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "Ethio Shield ",
-  "version": "0.1.0",
-  "description": "Flags pages with Amharic/English phishing cues and suspicious URLs.",
-  "icons": {
-    "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+  "name": "PhishShield (Amharic-first)",
+  "version": "0.2.0",
+  "description": "Flags pages with Amharic/English phishing cues and suspicious URLs. Popup shows reports.",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "PhishShield",
+    "default_popup": "popup.html"
   },
   "content_scripts": [
     {
@@ -14,6 +15,6 @@
       "js": ["content.js"],
       "run_at": "document_idle"
     }
-  ],
-  "host_permissions": ["<all_urls>"]
+  ]
 }
+
